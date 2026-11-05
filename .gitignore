@@ -1,0 +1,6 @@
+# Secrets and build outputs. Never commit these.
+.env
+work/
+out/
+build/
+build-log.txt

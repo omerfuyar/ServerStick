@@ -1,0 +1,1 @@
+# Masks /usr/lib/udev/rules.d/69-dm-lvm.rules: never auto-activate LVM volumes on the host disks.

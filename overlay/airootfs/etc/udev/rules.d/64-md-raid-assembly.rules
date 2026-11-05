@@ -1,0 +1,1 @@
+# Masks /usr/lib/udev/rules.d/64-md-raid-assembly.rules: never auto-assemble RAID arrays on the host disks.

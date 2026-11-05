@@ -1,0 +1,19 @@
+[Unit]
+Description=Join the Tailscale tailnet with the baked-in auth key
+Wants=tailscaled.service network-online.target
+After=tailscaled.service network-online.target
+# Keep retrying forever on a headless box.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/tailscale/autojoin.env
+ExecStart=/usr/local/bin/tailscale-autojoin
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=20min
+SyslogIdentifier=tailscale-autojoin
+
+[Install]
+WantedBy=multi-user.target
