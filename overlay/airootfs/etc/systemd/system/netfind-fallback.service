@@ -1,0 +1,16 @@
+[Unit]
+Description=Static IPv4 fallback when DHCP gives no address (netfind)
+Wants=NetworkManager.service
+After=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+# exec, not oneshot: boot doesn't wait for the 2-minute DHCP grace period.
+Type=exec
+ExecStart=/usr/local/bin/netfind --fallback --wait 120
+Restart=on-failure
+RestartSec=60
+SyslogIdentifier=netfind-fallback
+
+[Install]
+WantedBy=multi-user.target

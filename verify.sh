@@ -17,7 +17,7 @@ if [[ -f "$ROOT/.env" ]]; then
             printf 'EXTRA_PACKAGES=%q WIFI_SSID=%q TS_HOSTNAME=%q COW_SPACESIZE=%q\n' \
                 "${EXTRA_PACKAGES:-}" "${WIFI_SSID:-}" "${TS_HOSTNAME:-stickserver}" "${COW_SPACESIZE:-50%}")"
 fi
-BASE_PACKAGES="tailscale openssh nvidia-open nvidia-utils btop nvtop lm_sensors pciutils tmux git python"
+BASE_PACKAGES="$(sed -e 's/#.*//' "$ROOT/packages.txt" | tr -s ' \n' ' ')"
 
 T="$ROOT/build/verify"
 # Files extracted from the ISO are read-only; make them writable before deleting.
@@ -46,7 +46,7 @@ done
 echo "  listing squashfs"
 unsquashfs -lln "$SFS" >"$T/sfs.list"
 unsquashfs -q -n -d "$T/root" "$SFS" \
-    etc/tailscale etc/hostname var/lib/iwd usr/local/bin/tailscale-autojoin >/dev/null 2>&1 || true
+    etc/tailscale etc/hostname usr/local/bin/tailscale-autojoin >/dev/null 2>&1 || true
 
 python3 -I - "$T" "$BASE_PACKAGES $EXTRA_PACKAGES" "$WIFI_SSID" "$TS_HOSTNAME" "$COW_SPACESIZE" <<'PY'
 import os, posixpath, re, sys
@@ -103,6 +103,10 @@ except OSError:
 # --- scripts and units
 for p, mode in [("/usr/local/bin/tailscale-autojoin", "-rwxr-xr-x"),
                 ("/usr/local/bin/serverstick-status", "-rwxr-xr-x"),
+                ("/usr/local/bin/netfind", "-rwxr-xr-x"),
+                ("/root/.tmux/plugins/tpm/tpm", "-rwxr-xr-x"),
+                ("/root/.tmux.conf", None), ("/root/.config/fish/config.fish", None),
+                ("/etc/NetworkManager/conf.d/serverstick.conf", None),
                 ("/etc/systemd/system/tailscale-autojoin.service", None),
                 ("/etc/profile.d/zz-serverstick-banner.sh", None),
                 ("/usr/bin/tailscale", None), ("/usr/bin/tailscaled", None),
@@ -122,13 +126,14 @@ def enabled(unit, target):
     return f"/etc/systemd/system/{target}.wants/{unit}" in entries
 for unit, target in [("tailscaled.service", "multi-user.target"),
                      ("tailscale-autojoin.service", "multi-user.target"),
-                     ("systemd-networkd.service", "multi-user.target"),
+                     ("NetworkManager.service", "multi-user.target"),
                      ("systemd-resolved.service", "multi-user.target"),
-                     ("iwd.service", "multi-user.target"),
-                     ("systemd-networkd-wait-online.service", "network-online.target"),
+                     ("NetworkManager-wait-online.service", "network-online.target"),
                      ("systemd-timesyncd.service", "sysinit.target")]:
     check(enabled(unit, target), f"{unit} enabled ({target}.wants)")
 check(not enabled("sshd.service", "multi-user.target"), "sshd.service NOT enabled")
+for unit in ["systemd-networkd.service", "iwd.service"]:
+    check(not enabled(unit, "multi-user.target"), f"{unit} NOT enabled (NetworkManager owns networking)")
 check(not any(p.startswith("/etc/systemd/system/cloud-init.target.wants/") for p in entries), "cloud-init NOT enabled")
 
 # --- disk safeguards: masks must shadow real rules
@@ -144,10 +149,10 @@ for pkg in packages:
 
 # --- wifi
 if wifi_ssid:
-    psks = [p for p in entries if p.startswith("/var/lib/iwd/") and p.endswith(".psk")]
-    check(len(psks) == 1 and entries[psks[0]][0] == "-rw-------", f"iwd psk file present with mode 0600 ({psks})")
+    nm = entries.get("/etc/NetworkManager/system-connections/serverstick-wifi.nmconnection")
+    check(nm is not None and nm[0] == "-rw-------", "wifi NetworkManager profile present with mode 0600")
 else:
-    check(not any(p.startswith("/var/lib/iwd/") and p.endswith(".psk") for p in entries), "no iwd psk file (wifi not configured)")
+    check("/etc/NetworkManager/system-connections/serverstick-wifi.nmconnection" not in entries, "no wifi profile (wifi not configured)")
 
 # --- boot entries (ISO tree + EFI system partition image)
 counts = {}

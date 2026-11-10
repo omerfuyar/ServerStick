@@ -6,9 +6,13 @@ echo "${b}== $(uname -n) | $(uname -r) | up $(uptime -p | sed 's/^up //')${r}"
 
 echo "${b}== IP addresses${r}"
 ip -br addr show | grep -v '^lo '
+ip route show default | sed 's/^/  route: /'
+if [[ -z "$(ip -4 addr show scope global | grep -v tailscale)" ]]; then
+    echo "  ${b}No IPv4 address.${r} Find the gateway: netfind  (apply: netfind --apply)  or configure: nmtui"
+fi
 
 echo "${b}== Services${r}"
-for u in systemd-networkd systemd-networkd-wait-online systemd-timesyncd tailscaled tailscale-autojoin; do
+for u in NetworkManager NetworkManager-wait-online netfind-fallback systemd-timesyncd tailscaled tailscale-autojoin; do
     printf '  %-30s %s\n' "$u" "$(systemctl is-active "$u" 2>&1)"
 done
 printf '  %-30s %s\n' "clock synced" "$(timedatectl show -p NTPSynchronized --value 2>&1) ($(date -u '+%F %T UTC'))"

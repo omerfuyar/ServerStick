@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Find the default gateway and a free IPv4 address on a network where DHCP gave us nothing.
+
+No IPv4 address is needed: netfind listens to ARP and broadcast traffic on the wire, takes the
+address that other hosts keep asking for as the gateway (or ARP-probes common router addresses
+on a quiet network), probes for an unused address and prints a static config. --apply turns it
+into a NetworkManager profile.
+
+  netfind                     scan Ethernet/Wi-Fi ports that have a link but no IPv4
+  netfind -i enp3s0 -t 30     scan one port, listen for 30 s
+  netfind --apply             scan, then configure the first Ethernet port that found a gateway
+  netfind --undo              delete the profiles --apply made (back to DHCP)
+  netfind --fallback          boot mode (netfind-fallback.service): wait for DHCP, --apply if it never comes
+"""
+import argparse
+import collections
+import concurrent.futures
+import ipaddress
+import json
+import os
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+ETH_P_ARP = 0x0806
+ETH_P_IP = 0x0800
+PACKET_OUTGOING = 4
+BROADCAST = b"\xff" * 6
+PROFILE_PREFIX = "netfind-"
+FALLBACK_DNS = ["1.1.1.1", "9.9.9.9"]
+# Tried when the wire is too quiet to learn anything passively.
+COMMON_GATEWAYS = [
+    "192.168.1.1", "192.168.0.1", "192.168.1.254", "192.168.0.254", "192.168.2.1", "192.168.10.1",
+    "192.168.100.1", "192.168.178.1", "192.168.8.1", "192.168.31.1", "192.168.50.1", "192.168.88.1",
+    "192.168.43.1", "10.0.0.1", "10.0.0.138", "10.0.1.1", "10.1.1.1", "10.10.10.1", "172.16.0.1",
+    "172.20.10.1",
+]
+IPHONE_HOTSPOT = ipaddress.ip_network("172.20.10.0/28")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def usable_ip(raw):
+    ip = ipaddress.IPv4Address(raw)
+    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or ip.is_link_local or int(ip) == 0xFFFFFFFF:
+        return None
+    return ip
+
+
+def global_ipv4():
+    """{ifname: ["a.b.c.d/nn", ...]} for global IPv4 addresses, Tailscale excluded."""
+    try:
+        data = json.loads(run(["ip", "-j", "-4", "addr", "show"]).stdout or "[]")
+    except ValueError:
+        return {}
+    have = {}
+    for link in data:
+        name = link.get("ifname", "")
+        if name.startswith("tailscale"):
+            continue
+        for a in link.get("addr_info", []):
+            if a.get("family") == "inet" and a.get("scope") == "global":
+                have.setdefault(name, []).append(f"{a['local']}/{a['prefixlen']}")
+    return have
+
+
+def sysfs(name, attr):
+    try:
+        with open(f"/sys/class/net/{name}/{attr}") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def physical_ifaces():
+    return [n for n in sorted(os.listdir("/sys/class/net")) if os.path.exists(f"/sys/class/net/{n}/device")]
+
+
+def is_wireless(name):
+    return os.path.exists(f"/sys/class/net/{name}/wireless")
+
+
+def has_carrier(name):
+    return sysfs(name, "carrier") == "1"
+
+
+class Listener:
+    """Raw ARP + IPv4 sockets on one interface; collects who is on the wire."""
+
+    def __init__(self, ifname):
+        self.ifname = ifname
+        self.mac = bytes.fromhex(sysfs(ifname, "address").replace(":", ""))
+        self.own = {ipaddress.IPv4Address(a.split("/")[0]) for a in global_ipv4().get(ifname, [])}
+        self.asked = collections.defaultdict(set)  # target ip -> ips of hosts that ARPed for it
+        self.hosts = {}                            # ip -> mac of every host seen
+        self.replies = {}                          # ip -> mac from ARP replies (incl. to our probes)
+        self.frames = 0
+        self.arp = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+        self.arp.bind((ifname, ETH_P_ARP))
+        self.ip = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_IP))
+        self.ip.bind((ifname, ETH_P_IP))
+
+    def close(self):
+        self.arp.close()
+        self.ip.close()
+
+    def poll(self, seconds):
+        end = time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            ready, _, _ = select.select([self.arp, self.ip], [], [], left)
+            for s in ready:
+                frame, addr = s.recvfrom(2048)
+                if addr[2] == PACKET_OUTGOING:
+                    continue
+                self.frames += 1
+                if s is self.arp:
+                    self._arp(frame)
+                else:
+                    self._ipv4(frame)
+
+    def _arp(self, f):
+        if len(f) < 42:
+            return
+        _, ptype, hlen, plen, op = struct.unpack("!HHBBH", f[14:22])
+        if ptype != ETH_P_IP or hlen != 6 or plen != 4:
+            return
+        sha, spa, tpa = f[22:28], usable_ip(f[28:32]), usable_ip(f[38:42])
+        if not spa or spa in self.own:
+            return
+        self.hosts[spa] = sha
+        if op == 2:
+            self.replies[spa] = sha
+        elif op == 1 and tpa and tpa != spa:  # tpa == spa is a gratuitous announcement
+            self.asked[tpa].add(spa)
+
+    def _ipv4(self, f):
+        if len(f) < 34 or f[14] >> 4 != 4:
+            return
+        src = usable_ip(f[26:30])
+        if src and src.is_private and src not in self.own:
+            self.hosts.setdefault(src, f[6:12])
+
+    def probe(self, targets, wait=1.5):
+        """RFC 5227 ARP probe (sender 0.0.0.0): doesn't need or claim an address. Answers land in replies/hosts."""
+        for _ in range(2):
+            for t in targets:
+                arp = struct.pack("!HHBBH6s4s6s4s", 1, ETH_P_IP, 6, 4, 1, self.mac, bytes(4), bytes(6), t.packed)
+                self.arp.send((BROADCAST + self.mac + struct.pack("!H", ETH_P_ARP) + arp).ljust(60, b"\0"))
+            self.poll(wait / 2)
+
+
+def mac_str(b):
+    return ":".join(f"{x:02x}" for x in b) if b else "?"
+
+
+def infer_network(gw, peers):
+    """Smallest network (/24 down to /16) around the gateway that holds every host that ARPed for it."""
+    if gw in IPHONE_HOTSPOT:
+        return IPHONE_HOTSPOT
+    for prefix in range(24, 15, -1):
+        net = ipaddress.ip_network(f"{gw}/{prefix}", strict=False)
+        if all(p in net for p in peers):
+            return net
+    return ipaddress.ip_network(f"{gw}/24", strict=False)
+
+
+def free_address(lst, net, gw):
+    """Probe candidates (.250 down to .200 first, then the rest of the gateway's /24) for one nobody answers."""
+    if net.prefixlen >= 24:
+        pool = list(net.hosts())
+    else:
+        pool = list(ipaddress.ip_network(f"{gw}/24", strict=False).hosts())
+    pool.sort(key=lambda ip: (not 200 <= int(ip) % 256 <= 250, -int(ip)))
+    pool = [ip for ip in pool if ip != gw and ip not in lst.hosts and ip not in lst.own]
+    for i in range(0, min(len(pool), 64), 8):
+        batch = pool[i:i + 8]
+        lst.probe(batch)
+        for ip in batch:
+            if ip not in lst.hosts:
+                return ip
+    return None
+
+
+def discover(ifname, listen):
+    try:
+        lst = Listener(ifname)
+    except OSError as e:
+        log(f"[{ifname}] cannot open raw socket: {e}")
+        return None
+    try:
+        log(f"[{ifname}] listening to ARP/broadcast traffic for {listen}s (no IPv4 needed) ...")
+        lst.poll(listen)
+        ranked = sorted(lst.asked.items(),
+                        key=lambda kv: (len(kv[1]), int(kv[0]) % 256 in (1, 254)), reverse=True)
+        how = "most-asked-for address"
+        if ranked:
+            gw = ranked[0][0]
+            lst.probe([gw])
+        else:
+            guesses = []
+            for h in lst.hosts:
+                base = int(h) & ~0xFF
+                guesses += [ipaddress.IPv4Address(base + 1), ipaddress.IPv4Address(base + 254)]
+            guesses += [ipaddress.IPv4Address(g) for g in COMMON_GATEWAYS]
+            guesses = list(dict.fromkeys(g for g in guesses if g not in lst.own))
+            log(f"[{ifname}] heard {lst.frames} frames but no ARP requests; probing {len(guesses)} common router addresses")
+            lst.probe(guesses)
+            answered = [g for g in guesses if g in lst.replies]
+            if not answered:
+                log(f"[{ifname}] nothing answered: no gateway found (empty network or isolated port?)")
+                return None
+            gw, how = answered[0], "answered an ARP probe"
+        net = infer_network(gw, lst.asked.get(gw, set()))
+        ip = free_address(lst, net, gw)
+        res = {
+            "ifname": ifname, "gateway": gw, "gw_mac": lst.replies.get(gw) or lst.hosts.get(gw),
+            "gw_alive": gw in lst.replies, "how": how, "askers": len(lst.asked.get(gw, ())),
+            "network": net, "ip": ip, "hosts": len(lst.hosts),
+            "others": [(t, len(a)) for t, a in ranked[1:4]],
+        }
+        report(res)
+        return res if ip else None
+    finally:
+        lst.close()
+
+
+def nmcli_add_cmd(r):
+    gw = str(r["gateway"])
+    return ["nmcli", "connection", "add", "type", "ethernet", "ifname", r["ifname"],
+            "con-name", PROFILE_PREFIX + r["ifname"],
+            "connection.autoconnect", "yes", "connection.autoconnect-priority", "100",
+            "ipv4.method", "manual", "ipv4.addresses", f"{r['ip']}/{r['network'].prefixlen}",
+            "ipv4.gateway", gw, "ipv4.dns", ",".join([gw] + FALLBACK_DNS), "ipv6.method", "auto"]
+
+
+def report(r):
+    i = r["ifname"]
+    seen = f"asked for by {r['askers']} host(s)" if r["askers"] else r["how"]
+    alive = "answers ARP" if r["gw_alive"] else "did NOT answer our ARP probe"
+    log(f"[{i}] gateway  {r['gateway']}  mac {mac_str(r['gw_mac'])}  ({seen}; {alive})")
+    log(f"[{i}] subnet   {r['network']}  ({r['hosts']} host(s) seen on the wire)")
+    if r["others"]:
+        log(f"[{i}] other candidates: " + ", ".join(f"{t} ({n})" for t, n in r["others"]))
+    if not r["ip"]:
+        log(f"[{i}] no free address found among the probed candidates")
+        return
+    log(f"[{i}] free IP  {r['ip']}  (nobody answered an ARP probe for it)")
+    if is_wireless(i):
+        log(f"[{i}] Wi-Fi: set it on the active connection with nmtui, or:")
+        log(f"      nmcli connection modify <name> ipv4.method manual ipv4.addresses {r['ip']}/{r['network'].prefixlen} "
+            f"ipv4.gateway {r['gateway']} ipv4.dns {r['gateway']},{FALLBACK_DNS[0]}")
+        return
+    log(f"[{i}] apply:   netfind --apply -i {i}")
+    log(f"      or until reboot: ip addr add {r['ip']}/{r['network'].prefixlen} dev {i} && ip route add default via {r['gateway']}")
+
+
+def apply(r):
+    i, name = r["ifname"], PROFILE_PREFIX + r["ifname"]
+    run(["nmcli", "connection", "delete", name])
+    out = run(nmcli_add_cmd(r))
+    if out.returncode:
+        log(f"[{i}] nmcli connection add failed: {(out.stderr or out.stdout).strip()}")
+        return False
+    out = run(["nmcli", "--wait", "30", "connection", "up", name])
+    if out.returncode:
+        log(f"[{i}] nmcli connection up failed: {(out.stderr or out.stdout).strip()}")
+        return False
+    ok = run(["ping", "-c", "3", "-W", "2", "-I", i, str(r["gateway"])]).returncode == 0
+    log(f"[{i}] applied profile '{name}': {r['ip']}/{r['network'].prefixlen} via {r['gateway']}"
+        f" (gateway ping {'OK' if ok else 'FAILED (it may just block ping)'}). Undo: netfind --undo")
+    return True
+
+
+def undo():
+    names = [n for n in run(["nmcli", "-g", "NAME", "connection", "show"]).stdout.splitlines()
+             if n.startswith(PROFILE_PREFIX)]
+    for n in names:
+        run(["nmcli", "connection", "delete", n])
+        log(f"deleted {n}")
+    if not names:
+        log("no netfind profiles found")
+
+
+def pick_ifaces(requested, force, wired_only=False):
+    have = global_ipv4()
+    picked = []
+    for n in requested or physical_ifaces():
+        if not os.path.exists(f"/sys/class/net/{n}"):
+            log(f"[{n}] no such interface")
+            continue
+        if wired_only and is_wireless(n):
+            continue
+        if requested and not has_carrier(n):
+            run(["ip", "link", "set", n, "up"])
+            for _ in range(10):
+                if has_carrier(n):
+                    break
+                time.sleep(0.5)
+        if not has_carrier(n):
+            log(f"[{n}] no link (cable unplugged / Wi-Fi not associated), skipped")
+            continue
+        if n in have and not force and not requested:
+            log(f"[{n}] already has {', '.join(have[n])}, skipped (use -i {n} to scan anyway)")
+            continue
+        picked.append(n)
+    return picked
+
+
+def scan(ifaces, listen):
+    if not ifaces:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(len(ifaces)) as ex:
+        return [r for r in ex.map(lambda n: discover(n, listen), ifaces) if r]
+
+
+def ipv6_hint():
+    routes = run(["ip", "-6", "route", "show", "default"]).stdout.strip()
+    if routes:
+        log("IPv6 default route present (Tailscale can also connect over IPv6):")
+        for line in routes.splitlines():
+            log(f"  {line}")
+
+
+def fallback(args):
+    log(f"waiting up to {args.wait}s for an IPv4 address from DHCP")
+    deadline = time.monotonic() + args.wait
+    while True:
+        have = global_ipv4()
+        if have:
+            log("IPv4 present, nothing to do: " + "; ".join(f"{k} {' '.join(v)}" for k, v in have.items()))
+            return 0
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(5)
+    log(f"no IPv4 after {args.wait}s: looking for the gateway on the wire")
+    for r in scan(pick_ifaces(None, False, wired_only=True), args.time):
+        if apply(r):
+            return 0
+    log("fallback failed; systemd retries in 60s")
+    ipv6_hint()
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-i", "--iface", action="append", help="interface to scan (repeatable; default: all with a link and no IPv4)")
+    ap.add_argument("-t", "--time", type=int, default=15, help="seconds to listen (default 15)")
+    ap.add_argument("--force", action="store_true", help="also scan interfaces that already have IPv4")
+    ap.add_argument("--apply", action="store_true", help="create and activate a static NetworkManager profile")
+    ap.add_argument("--undo", action="store_true", help="delete profiles created by --apply")
+    ap.add_argument("--fallback", action="store_true", help="wait for DHCP first, apply only if no IPv4 appears")
+    ap.add_argument("--wait", type=int, default=120, help="--fallback: seconds to wait for DHCP (default 120)")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("netfind needs root (raw sockets)")
+    if args.undo:
+        undo()
+        return 0
+    if args.fallback:
+        return fallback(args)
+
+    results = scan(pick_ifaces(args.iface, args.force), args.time)
+    if args.apply:
+        wired = [r for r in results if not is_wireless(r["ifname"])]
+        if not wired:
+            log("nothing to apply")
+            return 1
+        return 0 if apply(wired[0]) else 1
+    ipv6_hint()
+    return 0 if results else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

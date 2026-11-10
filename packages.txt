@@ -1,0 +1,50 @@
+# Packages added on top of releng. One per line; '#' starts a comment.
+# Read by build.sh (installs them) and verify.sh (checks they are in the ISO).
+
+# Core: tailnet access, GPU, monitoring
+tailscale
+openssh
+nvidia-open
+nvidia-utils
+btop
+nvtop
+lm_sensors
+pciutils
+tmux
+git
+python
+
+# Networking: NetworkManager (nmcli / nmtui) replaces systemd-networkd + iwd
+networkmanager
+wpa_supplicant
+arp-scan
+iperf3
+wget
+lsof
+
+# Shell and editor, same as the desktop
+fish
+starship
+zoxide
+eza
+fzf
+bat
+fastfetch
+micro
+bash-completion
+
+# Terminal definitions, so ssh from kitty/foot/ghostty renders correctly
+kitty-terminfo
+foot-terminfo
+ghostty-terminfo
+
+# Everyday tools
+htop
+ncdu
+duf
+ripgrep
+fd
+jq
+tree
+unzip
+zip
