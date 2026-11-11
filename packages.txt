@@ -1,5 +1,5 @@
 # Packages added on top of releng. One per line; '#' starts a comment.
-# Read by build.sh (installs them) and verify.sh (checks they are in the ISO).
+# Read by `serverstick build` (installs them) and `serverstick verify` (checks they are in the ISO).
 
 # Core: tailnet access, GPU, monitoring
 tailscale

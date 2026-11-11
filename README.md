@@ -7,12 +7,12 @@ own disks are never mounted, formatted or auto-activated.
 
 ## What's in the image
 
-- releng base plus `tailscale openssh nvidia-open nvidia-utils btop nvtop lm_sensors pciutils tmux git python`,
+- releng base plus everything in `packages.txt` (tailscale, NVIDIA driver, monitoring, shell tools),
   and anything in `EXTRA_PACKAGES`.
 - All boot entries (systemd-boot, syslinux, and GRUB if present) get
   `copytoram=y cow_spacesize=$COW_SPACESIZE systemd.gpt_auto=0 systemd.swap=0` (default `50%`).
-- Wired DHCP (systemd-networkd), optional Wi-Fi (iwd), systemd-timesyncd, and
-  `systemd-networkd-wait-online --any` behind `network-online.target`.
+- NetworkManager for wired DHCP and optional Wi-Fi, `NetworkManager-wait-online` behind
+  `network-online.target`, systemd-timesyncd, and (with `NET_FALLBACK=1`) a static-IP fallback via `netfind`.
 - `tailscaled.service` plus `tailscale-autojoin.service`, a oneshot that runs `/usr/local/bin/tailscale-autojoin`:
   1. waits for the tailscaled socket,
   2. waits until `controlplane.tailscale.com` resolves (up to 300 s) and briefly for clock sync,
@@ -21,7 +21,8 @@ own disks are never mounted, formatted or auto-activated.
   4. logs every step to the journal. If all attempts fail, systemd restarts the unit every 30 s, forever.
 - Changes from releng: OpenSSH `sshd` is **disabled** (only Tailscale SSH works), **cloud-init is disabled**,
   and LVM and RAID auto-activation are masked (`/etc/udev/rules.d/69-dm-lvm.rules`, `64-md-raid-assembly.rules`).
-- tty1 logs in as root automatically and prints a status banner (`serverstick-status`).
+- No console autologin: log in as `root` with `ROOT_PASSWORD` from `.env`. Each console login prints a
+  status banner (`serverstick-status`). If `ROOT_PASSWORD` is empty, root has no password.
 
 **RAM:** two things use memory beyond your workloads:
 
@@ -44,15 +45,19 @@ Check usage with `df -h /run/archiso/cowspace /tmp` and `free -h`.
 | Path | Purpose |
 |---|---|
 | `overlay/airootfs/` | Static files copied over releng's airootfs (units, scripts, banner, udev masks, service symlinks) |
-| `build.sh` | One-command build |
-| `verify.sh` | Checks the finished ISO without booting it (`build.sh` runs it automatically) |
-| `test-qemu.sh` | Optional headless QEMU boot test |
-| `flash.sh` | Writes the ISO to a USB drive you pick from a list, then checks the written data |
+| `serverstick` | The command line: `build`, `verify`, `flash`, `test-qemu` (Lua) |
+| `tools/*.lua` | Its modules: `build`, `verify`, `flash`, `qemu`, plus shared `config` (.env) and `util` |
+| `packages.txt` | Packages added on top of releng |
 | `.env` | Your config and secrets (gitignored) |
 | `build/`, `work/`, `out/` | Generated profile, mkarchiso scratch space, finished ISO (all gitignored) |
 
-Files generated at build time (never tracked): `/etc/hostname`, `/etc/tailscale/authkey` (0600),
-`/etc/tailscale/autojoin.env`, and `/var/lib/iwd/<ssid>.psk` (0600, only if Wi-Fi is set).
+Files generated at build time (never tracked): `/etc/hostname`, `/etc/shadow` (root password hash),
+`/etc/tailscale/authkey` (0600), `/etc/tailscale/autojoin.env`, and the NetworkManager Wi-Fi profile
+(0600, only if Wi-Fi is set).
+
+The tooling is plain Lua (5.1-5.4 or LuaJIT, no extra modules). It calls the same system tools as before:
+archiso (`mkarchiso`, `unsquashfs`, `xorriso`, `mtools`, `bsdtar`), util-linux, `git`, `openssl`, and QEMU
+for tests. Install the interpreter with `sudo pacman -S lua` if you don't have one.
 
 ## 1. Create the auth key
 
@@ -100,22 +105,26 @@ Edit `.env`:
 
 ```ini
 TS_AUTHKEY=tskey-auth-...      # required
-TS_HOSTNAME=stickserver            # default stickserver
+TS_HOSTNAME=stickserver        # default stickserver
+ROOT_PASSWORD=...              # console login password (empty = no password)
 EXTRA_PACKAGES="cuda"          # optional, space-separated
 COW_SPACESIZE=50%              # optional: RAM limit for runtime writes, e.g. 75% or 8G
 WIFI_SSID=                     # optional, set both or neither
 WIFI_PASSWORD=
+NET_FALLBACK=1                 # optional: static-IP fallback when DHCP fails
 ```
+
+`.env` holds your auth key and password; keep it private (`chmod 600 .env`).
 
 ```bash
-./build.sh
+./serverstick build
 ```
 
-`build.sh` installs `archiso` if it's missing and asks for sudo once. It then copies a fresh
-`/usr/share/archiso/configs/releng` into `build/profile`, applies `overlay/`, renders the templated
-files, adds the packages, patches the boot entries, runs
-`mkarchiso -v -w work -o out build/profile`, gives `out/` back to your user, deletes `work/`,
-and runs `verify.sh`. It stops early if `TS_AUTHKEY` is missing or doesn't start with `tskey-`.
+Run it as your normal user (it asks for sudo once) or as root / with `sudo`; outputs always end up owned by
+you. It installs `archiso` if it's missing, copies a fresh `/usr/share/archiso/configs/releng` into
+`build/profile`, applies `overlay/`, renders the templated files (hostname, auth key, root password hash,
+Wi-Fi), adds the packages, patches the boot entries, runs `mkarchiso -v -w work -o out build/profile`,
+deletes `work/`, and runs `./serverstick verify`. It stops early if `.env` has a missing or invalid value.
 
 Result: `out/serverstick-YYYY.MM.DD-x86_64.iso`.
 
@@ -125,11 +134,11 @@ in the admin console if a stick gets lost.
 Optional boot test (the VM really joins your tailnet if the key is valid):
 
 ```bash
-./test-qemu.sh serial
+./serverstick test-qemu serial
 ```
 
-`./test-qemu.sh bios` and `./test-qemu.sh uefi` boot through the real menus and save a screenshot of the
-tty1 banner to `build/qemu/`.
+`./serverstick test-qemu bios` and `./serverstick test-qemu uefi` boot through the real menus, log in on tty1
+with `ROOT_PASSWORD`, and save a screenshot of the banner to `build/qemu/`.
 
 ## 3. Write the USB stick
 
@@ -138,14 +147,14 @@ This erases the whole stick.
 - **Linux, with the helper script:**
 
   ```bash
-  ./flash.sh
+  ./serverstick flash
   ```
 
   It lists USB/removable drives with their size, model, labels and mount points. The disk your system
   runs from is never listed. You pick a drive by number and confirm by typing its device name (e.g. `sdb`).
-  The script then unmounts the drive, writes the newest `out/serverstick-*.iso` with `dd`, and compares the
-  written data with the ISO. `./flash.sh --all` also lists internal disks, and `./flash.sh path/to.iso`
-  writes a specific ISO.
+  It then unmounts the drive, writes the newest `out/serverstick-*.iso` with `dd`, and compares the
+  written data with the ISO. `./serverstick flash --all` also lists internal disks, and
+  `./serverstick flash path/to.iso` writes a specific ISO.
 - **Linux, by hand:** find the stick with `lsblk`, then run (with your device instead of `/dev/sdX`):
 
   ```bash
@@ -173,12 +182,13 @@ one expires.
 
 ## Troubleshooting (console banner)
 
-Plug in a monitor. tty1 logs in as root and prints this banner; run `serverstick-status` to refresh it.
+Plug in a monitor and log in as `root` (password: `ROOT_PASSWORD`). The banner prints at login; run
+`serverstick-status` to refresh it.
 Follow live with `journalctl -fu tailscale-autojoin`.
 
 | Banner section | What to look for |
 |---|---|
-| **IP addresses** | No `UP` interface with an IPv4 address → no DHCP. Check the cable, or Wi-Fi: `iwctl station wlan0 show`, `networkctl status` |
+| **IP addresses** | No `UP` interface with an IPv4 address → no DHCP. Check the cable, or Wi-Fi: `nmcli device`, `nmcli connection`, `journalctl -u netfind-fallback` |
 | **Services** | `tailscaled` not `active` → `journalctl -u tailscaled`. `tailscale-autojoin` is `activating` while it waits/retries, `active` once joined, `failed`/`activating` again while it restarts every 30 s |
 | **clock synced** | `no` and the date is far off → TLS errors. Check that NTP (UDP 123) can get out |
 | **tailscale status** | `Logged out` / `NeedsLogin` → the join hasn't succeeded yet, see the journal lines. Hostname listed with a 100.x IP → joined |
