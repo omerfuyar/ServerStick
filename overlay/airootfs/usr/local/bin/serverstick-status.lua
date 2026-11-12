@@ -1,31 +1,52 @@
-#!/usr/bin/env bash
-# Short status overview. Shown at console login; run again any time.
-b=$'\e[1m'; r=$'\e[0m'
+#!/usr/bin/env lua
+-- Short status overview. Shown at console login; run again any time.
 
-echo "${b}== $(uname -n) | $(uname -r) | up $(uptime -p | sed 's/^up //')${r}"
+local self = io.popen("readlink -f '" .. (arg and arg[0] or ""):gsub("'", "'\\''") .. "'"):read("*l") or ""
+package.path = (self:match("^(.*)/[^/]*$") or ".") .. "/../lib/serverstick/?.lua;" .. package.path
 
-echo "${b}== IP addresses${r}"
-ip -br addr show | grep -v '^lo '
-ip route show default | sed 's/^/  route: /'
-if [[ -z "$(ip -4 addr show scope global | grep -v tailscale)" ]]; then
-    echo "  ${b}No IPv4 address.${r} Find the gateway: netfind  (apply: netfind --apply)  or configure: nmtui"
-fi
+local sys = require("sys")
+local net = require("net")
+local capture, quiet = sys.capture, sys.quiet
 
-echo "${b}== Services${r}"
-for u in NetworkManager NetworkManager-wait-online netfind-fallback systemd-timesyncd tailscaled tailscale-autojoin; do
-    printf '  %-30s %s\n' "$u" "$(systemctl is-active "$u" 2>&1)"
-done
-printf '  %-30s %s\n' "clock synced" "$(timedatectl show -p NTPSynchronized --value 2>&1) ($(date -u '+%F %T UTC'))"
-if lspci -d 10de: 2>/dev/null | grep -qiE 'vga|3d|display'; then
-    nvidia-smi -L 2>&1 | sed 's/^/  /'
+local B, R = "\27[1m", "\27[0m"
+local function out(s) io.stdout:write(s, "\n") end
+local function head(s) out(B .. "== " .. s .. R) end
+local function indent(text, prefix)
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    if line ~= "" then out(prefix .. line) end
+  end
+end
+
+local uptime = capture("uptime -p"):gsub("^up ", "")
+head(capture("uname -n") .. " | " .. capture("uname -r") .. " | up " .. uptime)
+
+head("IP addresses")
+indent(capture("ip -br addr show | grep -v '^lo '"), "")
+indent(capture("ip route show default"), "  route: ")
+if not net.has_ipv4() then
+  out("  " .. B .. "No IPv4 address." .. R
+    .. " Find the gateway: serverstick-gwscan.lua  (apply: serverstick-netfind.lua --apply)  or configure: nmtui")
+elseif not quiet("curl -sk -o /dev/null --connect-timeout 3 https://1.1.1.1/") then
+  out("  " .. B .. "IPv4 but no internet" .. R .. " (1.1.1.1:443 unreachable). Wrong gateway? Test them: serverstick-gwscan.lua")
+end
+
+head("Services")
+for _, u in ipairs({ "NetworkManager", "NetworkManager-wait-online", "netfind-fallback", "systemd-timesyncd",
+    "tailscaled", "tailscale-autojoin" }) do
+  out(string.format("  %-30s %s", u, capture("systemctl is-active " .. u .. " 2>&1")))
+end
+out(string.format("  %-30s %s (%s)", "clock synced",
+  capture("timedatectl show -p NTPSynchronized --value 2>&1"), os.date("!%Y-%m-%d %H:%M:%S UTC")))
+if quiet("lspci -d 10de: | grep -qiE 'vga|3d|display'") then
+  indent(capture("nvidia-smi -L 2>&1"), "  ")
 else
-    echo "  no NVIDIA GPU detected"
-fi
+  out("  no NVIDIA GPU detected")
+end
 
-echo "${b}== tailscale status${r}"
-tailscale status 2>&1 | head -n 15
+head("tailscale status")
+indent(capture("tailscale status 2>&1 | head -n 15"), "")
 
-echo "${b}== journalctl -u tailscale-autojoin (last 20)${r}"
-journalctl -u tailscale-autojoin -n 20 --no-pager -o short --no-hostname 2>&1
+head("journalctl -u tailscale-autojoin (last 20)")
+indent(capture("journalctl -u tailscale-autojoin -n 20 --no-pager -o short --no-hostname 2>&1"), "")
 
-echo "${b}Re-run: serverstick-status | follow: journalctl -fu tailscale-autojoin${r}"
+out(B .. "Re-run: serverstick-status.lua | follow: journalctl -fu tailscale-autojoin" .. R)

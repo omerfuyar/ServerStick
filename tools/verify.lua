@@ -61,6 +61,7 @@ return function(root, args)
 
   -- Expected values: non-secret settings from .env, packages from packages.txt.
   local env = config.load(root, false)
+  config.validate_static(env)
   local packages = config.packages(root)
   for _, p in ipairs(env.EXTRA) do packages[#packages + 1] = p end
 
@@ -97,7 +98,7 @@ return function(root, args)
     say("  listing squashfs")
     util.must("unsquashfs -lln " .. q(sfs) .. " > " .. q(T .. "/sfs.list"), "unsquashfs failed")
     util.run("unsquashfs -q -n -d " .. q(T .. "/root") .. " " .. q(sfs)
-      .. " etc/tailscale etc/hostname etc/shadow >/dev/null 2>&1")
+      .. " etc/tailscale etc/hostname etc/shadow etc/serverstick etc/NetworkManager/system-connections >/dev/null 2>&1")
 
     local entries, count = read_listing(T .. "/sfs.list")
     check(count > 1000, "squashfs listing parsed (" .. count .. " entries)")
@@ -129,9 +130,13 @@ return function(root, args)
 
     -- scripts, configs, binaries
     local files = {
-      { "/usr/local/bin/tailscale-autojoin", "-rwxr-xr-x" },
-      { "/usr/local/bin/serverstick-status", "-rwxr-xr-x" },
-      { "/usr/local/bin/netfind", "-rwxr-xr-x" },
+      { "/usr/local/bin/serverstick-autojoin.lua", "-rwxr-xr-x" },
+      { "/usr/local/bin/serverstick-status.lua", "-rwxr-xr-x" },
+      { "/usr/local/bin/serverstick-netfind.lua", "-rwxr-xr-x" },
+      { "/usr/local/bin/serverstick-gwscan.lua", "-rwxr-xr-x" },
+      { "/usr/local/lib/serverstick/sys.lua" }, { "/usr/local/lib/serverstick/net.lua" },
+      { "/usr/bin/lua" }, { "/usr/bin/tcpdump" }, { "/usr/bin/arping" }, { "/usr/bin/curl" },
+      { "/etc/serverstick/network.conf" },
       { "/root/.tmux/plugins/tpm/tpm", "-rwxr-xr-x" },
       { "/root/.tmux.conf" }, { "/root/.config/fish/config.fish" },
       { "/etc/NetworkManager/conf.d/serverstick.conf" },
@@ -221,6 +226,26 @@ return function(root, args)
       check(nm ~= nil and nm.mode == "-rw-------", "wifi NetworkManager profile present with mode 0600")
     else
       check(nm == nil, "no wifi profile (wifi not configured)")
+    end
+
+    -- static IP
+    local conf = util.read(T .. "/root/etc/serverstick/network.conf") or ""
+    check(conf:find("\nSTATIC_IP=" .. env.STATIC_CIDR:gsub("%p", "%%%0") .. "\n") ~= nil,
+      "network.conf has STATIC_IP=" .. env.STATIC_CIDR)
+    check(conf:find("\nFALLBACK_WAIT=" .. env.NET_FALLBACK_WAIT .. "\n", 1, true) ~= nil,
+      "network.conf has FALLBACK_WAIT=" .. env.NET_FALLBACK_WAIT)
+    for _, name in ipairs({ "serverstick-static", "serverstick-dhcp" }) do
+      local e = entries["/etc/NetworkManager/system-connections/" .. name .. ".nmconnection"]
+      if env.STATIC_CIDR ~= "" then
+        check(e ~= nil and e.mode == "-rw-------", name .. " NetworkManager profile present with mode 0600")
+      else
+        check(e == nil, "no " .. name .. " profile (STATIC_IP not set)")
+      end
+    end
+    if env.STATIC_CIDR ~= "" then
+      local kf = util.read(T .. "/root/etc/NetworkManager/system-connections/serverstick-static.nmconnection") or ""
+      local want = "address1=" .. env.STATIC_CIDR .. (env.STATIC_GATEWAY ~= "" and ("," .. env.STATIC_GATEWAY) or "")
+      check(kf:find("\n" .. want:gsub("%p", "%%%0") .. "\n") ~= nil, "static profile has " .. want)
     end
 
     -- boot entries (ISO tree + EFI system partition image)

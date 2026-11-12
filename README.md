@@ -11,9 +11,10 @@ own disks are never mounted, formatted or auto-activated.
   and anything in `EXTRA_PACKAGES`.
 - All boot entries (systemd-boot, syslinux, and GRUB if present) get
   `copytoram=y cow_spacesize=$COW_SPACESIZE systemd.gpt_auto=0 systemd.swap=0` (default `50%`).
-- NetworkManager for wired DHCP and optional Wi-Fi, `NetworkManager-wait-online` behind
-  `network-online.target`, systemd-timesyncd, and (with `NET_FALLBACK=1`) a static-IP fallback via `netfind`.
-- `tailscaled.service` plus `tailscale-autojoin.service`, a oneshot that runs `/usr/local/bin/tailscale-autojoin`:
+- NetworkManager for wired DHCP (or a fixed `STATIC_IP`) and optional Wi-Fi, `NetworkManager-wait-online` behind
+  `network-online.target`, systemd-timesyncd, and (with `NET_FALLBACK=1`) a network fallback, see
+  [Networks without DHCP](#networks-without-dhcp).
+- `tailscaled.service` plus `tailscale-autojoin.service`, a oneshot that runs `/usr/local/bin/serverstick-autojoin.lua`:
   1. waits for the tailscaled socket,
   2. waits until `controlplane.tailscale.com` resolves (up to 300 s) and briefly for clock sync,
   3. runs `tailscale up --auth-key=file:/etc/tailscale/authkey --ssh --hostname=$TS_HOSTNAME`
@@ -22,7 +23,7 @@ own disks are never mounted, formatted or auto-activated.
 - Changes from releng: OpenSSH `sshd` is **disabled** (only Tailscale SSH works), **cloud-init is disabled**,
   and LVM and RAID auto-activation are masked (`/etc/udev/rules.d/69-dm-lvm.rules`, `64-md-raid-assembly.rules`).
 - No console autologin: log in as `root` with `ROOT_PASSWORD` from `.env`. Each console login prints a
-  status banner (`serverstick-status`). If `ROOT_PASSWORD` is empty, root has no password.
+  status banner (`serverstick-status.lua`). If `ROOT_PASSWORD` is empty, root has no password.
 
 **RAM:** two things use memory beyond your workloads:
 
@@ -45,15 +46,16 @@ Check usage with `df -h /run/archiso/cowspace /tmp` and `free -h`.
 | Path | Purpose |
 |---|---|
 | `overlay/airootfs/` | Static files copied over releng's airootfs (units, scripts, banner, udev masks, service symlinks) |
-| `serverstick` | The command line: `build`, `verify`, `flash`, `test-qemu` (Lua) |
+| `serverstick.lua` | The command line: `build`, `verify`, `flash`, `test-qemu` (Lua) |
 | `tools/*.lua` | Its modules: `build`, `verify`, `flash`, `qemu`, plus shared `config` (.env) and `util` |
 | `packages.txt` | Packages added on top of releng |
 | `.env` | Your config and secrets (gitignored) |
 | `build/`, `work/`, `out/` | Generated profile, mkarchiso scratch space, finished ISO (all gitignored) |
 
 Files generated at build time (never tracked): `/etc/hostname`, `/etc/shadow` (root password hash),
-`/etc/tailscale/authkey` (0600), `/etc/tailscale/autojoin.env`, and the NetworkManager Wi-Fi profile
-(0600, only if Wi-Fi is set).
+`/etc/tailscale/authkey` (0600), `/etc/tailscale/autojoin.env`, `/etc/serverstick/network.conf`, and the
+NetworkManager profiles (0600): `serverstick-wifi` if Wi-Fi is set, `serverstick-static` + `serverstick-dhcp`
+if `STATIC_IP` is set.
 
 The tooling is plain Lua (5.1-5.4 or LuaJIT, no extra modules). It calls the same system tools as before:
 archiso (`mkarchiso`, `unsquashfs`, `xorriso`, `mtools`, `bsdtar`), util-linux, `git`, `openssl`, and QEMU
@@ -111,20 +113,24 @@ EXTRA_PACKAGES="cuda"          # optional, space-separated
 COW_SPACESIZE=50%              # optional: RAM limit for runtime writes, e.g. 75% or 8G
 WIFI_SSID=                     # optional, set both or neither
 WIFI_PASSWORD=
-NET_FALLBACK=1                 # optional: static-IP fallback when DHCP fails
+STATIC_IP=                     # optional fixed address a.b.c.d/nn for networks without DHCP
+STATIC_GATEWAY=                #   its gateway (empty: found at boot by the gateway scan)
+STATIC_DNS=                    #   DNS servers (default: gateway, 1.1.1.1, 9.9.9.9)
+NET_FALLBACK=1                 # optional: static -> DHCP -> gateway scan fallback
+NET_FALLBACK_WAIT=45           # optional: seconds to wait for DHCP before scanning
 ```
 
 `.env` holds your auth key and password; keep it private (`chmod 600 .env`).
 
 ```bash
-./serverstick build
+./serverstick.lua build
 ```
 
 Run it as your normal user (it asks for sudo once) or as root / with `sudo`; outputs always end up owned by
 you. It installs `archiso` if it's missing, copies a fresh `/usr/share/archiso/configs/releng` into
 `build/profile`, applies `overlay/`, renders the templated files (hostname, auth key, root password hash,
 Wi-Fi), adds the packages, patches the boot entries, runs `mkarchiso -v -w work -o out build/profile`,
-deletes `work/`, and runs `./serverstick verify`. It stops early if `.env` has a missing or invalid value.
+deletes `work/`, and runs `./serverstick.lua verify`. It stops early if `.env` has a missing or invalid value.
 
 Result: `out/serverstick-YYYY.MM.DD-x86_64.iso`.
 
@@ -134,10 +140,10 @@ in the admin console if a stick gets lost.
 Optional boot test (the VM really joins your tailnet if the key is valid):
 
 ```bash
-./serverstick test-qemu serial
+./serverstick.lua test-qemu serial
 ```
 
-`./serverstick test-qemu bios` and `./serverstick test-qemu uefi` boot through the real menus, log in on tty1
+`./serverstick.lua test-qemu bios` and `./serverstick.lua test-qemu uefi` boot through the real menus, log in on tty1
 with `ROOT_PASSWORD`, and save a screenshot of the banner to `build/qemu/`.
 
 ## 3. Write the USB stick
@@ -147,14 +153,14 @@ This erases the whole stick.
 - **Linux, with the helper script:**
 
   ```bash
-  ./serverstick flash
+  ./serverstick.lua flash
   ```
 
   It lists USB/removable drives with their size, model, labels and mount points. The disk your system
   runs from is never listed. You pick a drive by number and confirm by typing its device name (e.g. `sdb`).
   It then unmounts the drive, writes the newest `out/serverstick-*.iso` with `dd`, and compares the
-  written data with the ISO. `./serverstick flash --all` also lists internal disks, and
-  `./serverstick flash path/to.iso` writes a specific ISO.
+  written data with the ISO. `./serverstick.lua flash --all` also lists internal disks, and
+  `./serverstick.lua flash path/to.iso` writes a specific ISO.
 - **Linux, by hand:** find the stick with `lsblk`, then run (with your device instead of `/dev/sdX`):
 
   ```bash
@@ -183,12 +189,13 @@ one expires.
 ## Troubleshooting (console banner)
 
 Plug in a monitor and log in as `root` (password: `ROOT_PASSWORD`). The banner prints at login; run
-`serverstick-status` to refresh it.
-Follow live with `journalctl -fu tailscale-autojoin`.
+`serverstick-status.lua` to refresh it.
+Follow live with `journalctl -fu tailscale-autojoin`. All scripts on the stick are Lua and named
+`serverstick-*.lua` in `/usr/local/bin` (tab-complete `serverstick-`); shared code is in `/usr/local/lib/serverstick/`.
 
 | Banner section | What to look for |
 |---|---|
-| **IP addresses** | No `UP` interface with an IPv4 address → no DHCP. Check the cable, or Wi-Fi: `nmcli device`, `nmcli connection`, `journalctl -u netfind-fallback` |
+| **IP addresses** | No `UP` interface with an IPv4 address → no DHCP. "IPv4 but no internet" → wrong gateway. See [Networks without DHCP](#networks-without-dhcp). Wi-Fi: `nmcli device`, `nmcli connection` |
 | **Services** | `tailscaled` not `active` → `journalctl -u tailscaled`. `tailscale-autojoin` is `activating` while it waits/retries, `active` once joined, `failed`/`activating` again while it restarts every 30 s |
 | **clock synced** | `no` and the date is far off → TLS errors. Check that NTP (UDP 123) can get out |
 | **tailscale status** | `Logged out` / `NeedsLogin` → the join hasn't succeeded yet, see the journal lines. Hostname listed with a 100.x IP → joined |
@@ -205,3 +212,40 @@ Follow live with `journalctl -fu tailscale-autojoin`.
 | Joined, but node missing or shows "Needs approval" in the admin page | Device approval is on and the key wasn't pre-approved → approve it, or use a pre-approved key |
 | Joined, but `ssh` is refused | Tailnet policy `ssh` rules don't cover this node (needed for tagged nodes, see above) |
 | `step 4/4: joined` | Working. Connect with `ssh root@<hostname>` |
+
+### Networks without DHCP
+
+Offices and labs often give each machine a fixed IP. Then the stick gets no IPv4 address.
+
+**What the stick does at boot** (`netfind-fallback.service`, `NET_FALLBACK=1`; log: `journalctl -u netfind-fallback -b`):
+
+1. With `STATIC_IP` set: use it (profile `serverstick-static`). If the internet answers, done. If not, drop it
+   for this boot and try DHCP for 45 s.
+2. Wait `NET_FALLBACK_WAIT` seconds (default 45) for DHCP, listening to the wire meanwhile.
+3. Still nothing: test the gateway candidates it heard and apply the first one that **actually reaches the
+   internet** (profile `netfind-<port>`, address `STATIC_IP` if set, else a free one). Nothing works →
+   keep `STATIC_IP`, retry every 60 s.
+4. Then it keeps watching. If the box loses IPv4 on every port (cable moved to another network), it starts
+   over. A scanned gateway lasts until the link changes, so a network with DHCP always gets the first try.
+
+With `.env` left empty, a network without DHCP is online about a minute after boot, with no settings.
+`netfind-fallback` shows `active` in the banner for the whole uptime: that is the watcher.
+
+**Gateway scan by hand:** `serverstick-gwscan.lua` listens to the wire (no IP needed), lists every address that
+could be the router (`STATIC_GATEWAY`, addresses other machines keep asking for, `.1`/`.254` of each subnet
+seen, all other hosts), then routes 1.1.1.1, 8.8.8.8, ... through each one in turn and tries TCP 443 / ping.
+It only adds temporary test routes and removes them; it changes nothing else unless you pass `--apply`.
+
+```bash
+serverstick-gwscan.lua                          # scan every wired port
+serverstick-gwscan.lua -i eno1 -a 192.168.163.250/24 -t 30   # test from a chosen address
+serverstick-gwscan.lua --apply                  # configure the first working gateway
+serverstick-netfind.lua --undo                  # remove profiles made by --apply
+```
+
+Each candidate is shown as `INTERNET OK`, `on the wire, no internet` (a printer, server, PC, ...) or
+`no ARP answer`. Put the working one in `.env` as `STATIC_GATEWAY` (with the machine's address as
+`STATIC_IP`) and rebuild, so the stick comes up right away next time.
+
+Nothing reaches the internet, not even with the right address: the switch port may only allow
+registered machines (MAC filtering / 802.1X) or outbound traffic may need a proxy. Ask the network admin.

@@ -123,11 +123,33 @@ function M.mkdir(path, mode)
 end
 
 -- Remove a tree, including read-only files extracted from an ISO.
+-- Mount points at or below path, deepest first.
+local function mounts_under(path)
+  local list = {}
+  for target in M.lines_of("findmnt -rn -o TARGET") do
+    if target == path or target:sub(1, #path + 1) == path .. "/" then list[#list + 1] = target end
+  end
+  table.sort(list, function(a, b) return #a > #b end)
+  return list
+end
+
+-- Never deletes through a mount: anything still mounted below path (e.g. /proc or /dev left
+-- behind by a failed mkarchiso chroot) is unmounted first, and rm stays on one filesystem.
 function M.wipe(path, privileged)
   if not M.test("-e", path) and not M.test("-L", path) then return end
   local p = privileged and M.priv or function(s) return s end
+  for _, m in ipairs(mounts_under(path)) do
+    M.say("  unmounting leftover " .. m)
+    if not M.run(p("umount " .. M.q(m)) .. " 2>/dev/null") then
+      M.run(p("umount -l " .. M.q(m)) .. " 2>/dev/null")
+    end
+  end
+  local left = mounts_under(path)
+  if #left > 0 then
+    M.die("not removing " .. path .. ": still mounted: " .. table.concat(left, ", "))
+  end
   M.run(p("chmod -R u+w " .. M.q(path)) .. " 2>/dev/null")
-  M.must(p("rm -rf " .. M.q(path)), "cannot remove")
+  M.must(p("rm -rf --one-file-system " .. M.q(path)), "cannot remove " .. path)
 end
 
 function M.size(path)

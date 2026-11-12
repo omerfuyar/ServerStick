@@ -1,5 +1,5 @@
 # Packages added on top of releng. One per line; '#' starts a comment.
-# Read by `serverstick build` (installs them) and `serverstick verify` (checks they are in the ISO).
+# Read by `./serverstick.lua build` (installs them) and `./serverstick.lua verify` (checks they are in the ISO).
 
 # Core: tailnet access, GPU, monitoring
 tailscale
@@ -13,11 +13,17 @@ pciutils
 tmux
 git
 python
+# Runtime for the /usr/local/bin/serverstick-*.lua scripts
+lua
 
 # Networking: NetworkManager (nmcli / nmtui) replaces systemd-networkd + iwd
 networkmanager
 wpa_supplicant
 arp-scan
+# Used by serverstick-gwscan.lua / serverstick-netfind.lua
+tcpdump
+iputils
+curl
 iperf3
 wget
 lsof

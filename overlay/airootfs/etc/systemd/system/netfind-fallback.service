@@ -1,13 +1,14 @@
 [Unit]
-Description=Static IPv4 fallback when DHCP gives no address (netfind)
+Description=Network fallback: static IP check, DHCP, then tested gateway scan; keeps watching (serverstick-netfind.lua)
 Wants=NetworkManager.service
 After=NetworkManager.service
 StartLimitIntervalSec=0
 
 [Service]
-# exec, not oneshot: boot doesn't wait for the 2-minute DHCP grace period.
+# Runs for the whole uptime: gets the box online, then watches for a lost connection.
+# exec, not oneshot: boot does not wait for it.
 Type=exec
-ExecStart=/usr/local/bin/netfind --fallback --wait 120
+ExecStart=/usr/local/bin/serverstick-netfind.lua --fallback
 Restart=on-failure
 RestartSec=60
 SyslogIdentifier=netfind-fallback

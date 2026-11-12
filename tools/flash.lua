@@ -37,7 +37,7 @@ return function(root, args)
   local show_all = false
   if args[1] == "--all" then show_all = true; table.remove(args, 1) end
   local iso = args[1] or util.latest_iso(root)
-  if not iso or not util.test("-f", iso) then die("no ISO found. Build one with ./serverstick build or pass a path") end
+  if not iso or not util.test("-f", iso) then die("no ISO found. Build one with ./serverstick.lua build or pass a path") end
   local iso_bytes = util.size(iso)
   say("ISO: " .. iso .. " (" .. util.human(iso_bytes) .. ")")
 

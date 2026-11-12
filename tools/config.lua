@@ -11,7 +11,11 @@ M.DEFAULTS = {
   WIFI_SSID = "",
   WIFI_PASSWORD = "",
   NET_FALLBACK = "1",
+  NET_FALLBACK_WAIT = "45",
   ROOT_PASSWORD = "",
+  STATIC_IP = "",
+  STATIC_GATEWAY = "",
+  STATIC_DNS = "",
 }
 
 -- Parse a .env file: KEY=value, KEY="value", KEY='value', optional "export ",
@@ -101,6 +105,8 @@ function M.validate(env)
   end
 
   if env.NET_FALLBACK ~= "0" and env.NET_FALLBACK ~= "1" then util.die("NET_FALLBACK must be 1 or 0") end
+  local fw = tonumber(env.NET_FALLBACK_WAIT:match("^%d+$") or "")
+  if not fw or fw < 5 or fw > 3600 then util.die("NET_FALLBACK_WAIT must be a number of seconds (5-3600)") end
 
   local cow = env.COW_SPACESIZE
   local pct = cow:match("^(%d+)%%$")
@@ -111,6 +117,55 @@ function M.validate(env)
   end
 
   if env.ROOT_PASSWORD:find("[\n\r]") then util.die("ROOT_PASSWORD must not contain newlines") end
+
+  M.validate_static(env)
+end
+
+-- a.b.c.d -> 32-bit number, or nil.
+local function ipv4(s)
+  local a, b, c, d = s:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+  if not a then return nil end
+  local n = 0
+  for _, part in ipairs({ a, b, c, d }) do
+    if #part > 1 and part:sub(1, 1) == "0" then return nil end
+    local v = tonumber(part)
+    if v > 255 then return nil end
+    n = n * 256 + v
+  end
+  return n
+end
+
+-- STATIC_IP (a.b.c.d or a.b.c.d/nn, default /24), STATIC_GATEWAY, STATIC_DNS.
+-- Sets env.STATIC_CIDR ("a.b.c.d/nn") and env.STATIC_DNS_LIST.
+function M.validate_static(env)
+  env.STATIC_CIDR = ""
+  env.STATIC_DNS_LIST = {}
+  if env.STATIC_IP == "" then
+    if env.STATIC_GATEWAY ~= "" or env.STATIC_DNS ~= "" then
+      util.die("STATIC_GATEWAY / STATIC_DNS need STATIC_IP")
+    end
+    return
+  end
+  local addr, prefix = env.STATIC_IP:match("^([%d.]+)/(%d+)$")
+  if not addr then addr, prefix = env.STATIC_IP, "24" end
+  local ip, pfx = ipv4(addr), tonumber(prefix)
+  if not ip or not pfx or pfx < 8 or pfx > 30 then
+    util.die("STATIC_IP '" .. env.STATIC_IP .. "' must be an IPv4 address like 192.168.1.50 or 192.168.1.50/24 (/8-/30)")
+  end
+  env.STATIC_CIDR = addr .. "/" .. pfx
+  if env.STATIC_GATEWAY ~= "" then
+    local gw = ipv4(env.STATIC_GATEWAY)
+    if not gw then util.die("STATIC_GATEWAY '" .. env.STATIC_GATEWAY .. "' is not an IPv4 address") end
+    local size = 2 ^ (32 - pfx)
+    if math.floor(gw / size) ~= math.floor(ip / size) then
+      util.die("STATIC_GATEWAY " .. env.STATIC_GATEWAY .. " is outside " .. env.STATIC_CIDR)
+    end
+    if gw == ip then util.die("STATIC_GATEWAY is the same as STATIC_IP") end
+  end
+  for _, d in ipairs(util.words((env.STATIC_DNS:gsub(",", " ")))) do
+    if not ipv4(d) then util.die("STATIC_DNS: '" .. d .. "' is not an IPv4 address") end
+    env.STATIC_DNS_LIST[#env.STATIC_DNS_LIST + 1] = d
+  end
 end
 
 return M

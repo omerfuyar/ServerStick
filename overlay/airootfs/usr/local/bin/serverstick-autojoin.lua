@@ -1,126 +1,173 @@
-#!/usr/bin/env bash
-# Join the tailnet with the baked-in auth key. Run by tailscale-autojoin.service.
-# Every line goes to the journal: journalctl -u tailscale-autojoin
-#
-# Tunables (env, optional): SOCKET_TIMEOUT, NET_TIMEOUT, CLOCK_TIMEOUT, MAX_ATTEMPTS
-set -uo pipefail
+#!/usr/bin/env lua
+-- Join the tailnet with the baked-in auth key. Run by tailscale-autojoin.service.
+-- Every line goes to the journal: journalctl -u tailscale-autojoin
+--
+-- Tunables (env, optional): SOCKET_TIMEOUT, NET_TIMEOUT, CLOCK_TIMEOUT, MAX_ATTEMPTS
 
-AUTHKEY_FILE=/etc/tailscale/authkey
-SOCKET=/run/tailscale/tailscaled.sock
-CONTROL_HOST=controlplane.tailscale.com
-TS_HOSTNAME="${TS_HOSTNAME:-stickserver}"
-SOCKET_TIMEOUT="${SOCKET_TIMEOUT:-90}"
-NET_TIMEOUT="${NET_TIMEOUT:-300}"
-CLOCK_TIMEOUT="${CLOCK_TIMEOUT:-30}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"
+local self = io.popen("readlink -f '" .. (arg and arg[0] or ""):gsub("'", "'\\''") .. "'"):read("*l") or ""
+package.path = (self:match("^(.*)/[^/]*$") or ".") .. "/../lib/serverstick/?.lua;" .. package.path
 
-# "<N>" prefixes set the journal priority (3=err, 4=warning, 5=notice, 6=info).
-info() { echo "<6>$*"; }
-note() { echo "<5>$*"; }
-warn() { echo "<4>$*"; }
-err()  { echo "<3>$*"; }
+local sys = require("sys")
+local q, run, quiet, capture = sys.q, sys.run, sys.quiet, sys.capture
 
-dump_network() {
-    info "  ip addr:";  ip -br addr 2>&1 | sed 's/^/<6>    /'
-    info "  routes:";   ip route 2>&1   | sed 's/^/<6>    /'
-    info "  dns:";      resolvectl dns 2>&1 | sed 's/^/<6>    /'
-}
+local AUTHKEY_FILE = "/etc/tailscale/authkey"
+local SOCKET = "/run/tailscale/tailscaled.sock"
+local CONTROL_HOST = "controlplane.tailscale.com"
+local function env(name, default)
+  local v = os.getenv(name)
+  return (v and v ~= "") and v or default
+end
+local TS_HOSTNAME = env("TS_HOSTNAME", "stickserver")
+local SOCKET_TIMEOUT = tonumber(env("SOCKET_TIMEOUT", "90"))
+local NET_TIMEOUT = tonumber(env("NET_TIMEOUT", "300"))
+local CLOCK_TIMEOUT = tonumber(env("CLOCK_TIMEOUT", "30"))
+local MAX_ATTEMPTS = tonumber(env("MAX_ATTEMPTS", "8"))
 
-backend_state() {
-    tailscale status --json 2>/dev/null \
-        | sed -n 's/^[[:space:]]*"BackendState":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
-}
+-- "<N>" prefixes set the journal priority (3=err, 4=warning, 5=notice, 6=info).
+local function say(prio, msg)
+  for line in (msg .. "\n"):gmatch("([^\n]*)\n") do io.stdout:write("<", prio, ">", line, "\n") end
+end
+local function info(m) say(6, m) end
+local function note(m) say(5, m) end
+local function warn(m) say(4, m) end
+local function err(m) say(3, m) end
 
-note "step 0/4: checking config (hostname=${TS_HOSTNAME})"
-if [[ ! -s "$AUTHKEY_FILE" ]]; then
-    err "auth key file $AUTHKEY_FILE is missing or empty; rebuild the ISO with TS_AUTHKEY in .env"
-    exit 1
-fi
-if ! head -c 6 "$AUTHKEY_FILE" | grep -q '^tskey-'; then
-    err "auth key in $AUTHKEY_FILE does not start with 'tskey-'"
-    exit 1
-fi
-info "auth key file present ($(stat -c '%a %U' "$AUTHKEY_FILE"))"
+-- Command output, every line indented and logged at info level.
+local function dump(cmd, indent)
+  local out = capture(cmd .. " 2>&1")
+  for line in (out .. "\n"):gmatch("([^\n]*)\n") do
+    if line ~= "" then info(indent .. line) end
+  end
+end
 
-note "step 1/4: waiting for tailscaled socket $SOCKET (timeout ${SOCKET_TIMEOUT}s)"
-for ((i = 0; i < SOCKET_TIMEOUT; i++)); do
-    [[ -S "$SOCKET" ]] && tailscale status --json >/dev/null 2>&1 && break
-    sleep 1
-done
-if [[ ! -S "$SOCKET" ]]; then
-    err "tailscaled socket did not appear after ${SOCKET_TIMEOUT}s; check: journalctl -u tailscaled"
-    exit 1
-fi
-state="$(backend_state)"
-info "tailscaled is up, backend state: ${state:-unknown}"
-if [[ "$state" == "Running" ]]; then
-    note "already joined, nothing to do"
-    tailscale status 2>&1 | head -n 5 | sed 's/^/<6>  /'
-    exit 0
-fi
+local function dump_network()
+  info("  ip addr:")
+  dump("ip -br addr", "    ")
+  info("  routes:")
+  dump("ip route", "    ")
+  info("  dns:")
+  dump("resolvectl dns", "    ")
+end
 
-note "step 2/4: waiting for network (resolve $CONTROL_HOST, timeout ${NET_TIMEOUT}s)"
-start=$SECONDS
-last_log=-30
-until getent ahosts "$CONTROL_HOST" >/dev/null 2>&1; do
-    elapsed=$((SECONDS - start))
-    if ((elapsed >= NET_TIMEOUT)); then
-        err "cannot resolve $CONTROL_HOST after ${NET_TIMEOUT}s: no usable network/DNS"
-        dump_network
-        exit 1
-    fi
-    if ((elapsed - last_log >= 30)); then
-        last_log=$elapsed
-        info "still waiting for network (${elapsed}s)"
-        ip -br addr 2>&1 | grep -v '^lo ' | sed 's/^/<6>    /'
-    fi
-    sleep 2
-done
-info "$CONTROL_HOST resolves to: $(getent ahosts "$CONTROL_HOST" | awk '{print $1}' | sort -u | tr '\n' ' ')"
-dump_network
+local function backend_state()
+  local json = capture("tailscale status --json 2>/dev/null")
+  return json:match('"BackendState":%s*"([^"]*)"') or ""
+end
 
-# A wrong clock breaks TLS. Give timesyncd a moment, but don't block on it.
-for ((i = 0; i < CLOCK_TIMEOUT; i++)); do
-    [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]] && break
-    sleep 1
-done
-if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; then
-    info "clock synchronized: $(date -u '+%F %T UTC')"
-else
-    warn "clock NOT synchronized yet after ${CLOCK_TIMEOUT}s (now $(date -u '+%F %T UTC')); TLS may fail if it is far off"
-fi
+local function clock_synced()
+  return capture("timedatectl show -p NTPSynchronized --value 2>/dev/null") == "yes"
+end
 
-note "step 3/4: tailscale up (max ${MAX_ATTEMPTS} attempts)"
-delay=5
-for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
-    info "attempt ${attempt}/${MAX_ATTEMPTS}: tailscale up --auth-key=file:${AUTHKEY_FILE} --ssh --hostname=${TS_HOSTNAME}"
-    out="$(tailscale up --auth-key="file:${AUTHKEY_FILE}" --ssh --hostname="${TS_HOSTNAME}" --timeout=60s 2>&1)"
-    rc=$?
-    [[ -n "$out" ]] && sed 's/^/<6>  | /' <<<"$out"
-    if ((rc == 0)); then
-        break
-    fi
-    warn "tailscale up failed (exit $rc)"
-    case "$out" in
-        *invalid*key*|*expired*|*"not valid"*) warn "hint: the auth key looks invalid/expired/used-up; create a new reusable key and rebuild" ;;
-        *tagOwners*|*"tags"*)                  warn "hint: tagged key needs tagOwners in the tailnet policy (see README)" ;;
-        *x509*|*certificate*)                  warn "hint: TLS error; check the clock: $(date -u)" ;;
-    esac
-    if ((attempt == MAX_ATTEMPTS)); then
-        err "giving up after ${MAX_ATTEMPTS} attempts (systemd will restart this unit)"
-        exit 1
-    fi
-    info "retrying in ${delay}s"
-    sleep "$delay"
-    delay=$((delay * 2 > 60 ? 60 : delay * 2))
-done
+local function utc_now()
+  return os.date("!%Y-%m-%d %H:%M:%S UTC")
+end
 
-note "step 4/4: joined"
-info "tailscale IPs: $(tailscale ip 2>/dev/null | tr '\n' ' ')"
-tailscale status 2>&1 | head -n 10 | sed 's/^/<6>  /'
-# The tailnet may hand out "<name>-1" if an old node with the same name still exists.
-name="$(tailscale status --json 2>/dev/null \
-    | python -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].split(".")[0])' 2>/dev/null)"
-[[ -n "$name" && "$name" != "$TS_HOSTNAME" ]] \
-    && warn "tailnet name is '$name' (not '$TS_HOSTNAME'): an older node with that name still exists"
-note "done: connect with ssh root@${name:-$TS_HOSTNAME}"
+local function main()
+  note("step 0/4: checking config (hostname=" .. TS_HOSTNAME .. ")")
+  local key = sys.read(AUTHKEY_FILE)
+  if not key or key == "" then
+    err("auth key file " .. AUTHKEY_FILE .. " is missing or empty; rebuild the ISO with TS_AUTHKEY in .env")
+    return 1
+  end
+  if key:sub(1, 6) ~= "tskey-" then
+    err("auth key in " .. AUTHKEY_FILE .. " does not start with 'tskey-'")
+    return 1
+  end
+  info("auth key file present (" .. capture("stat -c '%a %U' " .. q(AUTHKEY_FILE)) .. ")")
+
+  note("step 1/4: waiting for tailscaled socket " .. SOCKET .. " (timeout " .. SOCKET_TIMEOUT .. "s)")
+  local up = false
+  for _ = 1, SOCKET_TIMEOUT do
+    if run("test -S " .. q(SOCKET)) and quiet("tailscale status --json") then
+      up = true
+      break
+    end
+    sys.sleep(1)
+  end
+  if not up and not run("test -S " .. q(SOCKET)) then
+    err("tailscaled socket did not appear after " .. SOCKET_TIMEOUT .. "s; check: journalctl -u tailscaled")
+    return 1
+  end
+  local state = backend_state()
+  info("tailscaled is up, backend state: " .. (state ~= "" and state or "unknown"))
+  if state == "Running" then
+    note("already joined, nothing to do")
+    dump("tailscale status | head -n 5", "  ")
+    return 0
+  end
+
+  note("step 2/4: waiting for network (resolve " .. CONTROL_HOST .. ", timeout " .. NET_TIMEOUT .. "s)")
+  local start, last_log = sys.now(), -30
+  while not quiet("getent ahosts " .. CONTROL_HOST) do
+    local elapsed = math.floor(sys.now() - start)
+    if elapsed >= NET_TIMEOUT then
+      err("cannot resolve " .. CONTROL_HOST .. " after " .. NET_TIMEOUT .. "s: no usable network/DNS")
+      dump_network()
+      return 1
+    end
+    if elapsed - last_log >= 30 then
+      last_log = elapsed
+      info("still waiting for network (" .. elapsed .. "s)")
+      dump("ip -br addr | grep -v '^lo '", "    ")
+    end
+    sys.sleep(2)
+  end
+  info(CONTROL_HOST .. " resolves to: "
+    .. capture("getent ahosts " .. CONTROL_HOST .. " | awk '{print $1}' | sort -u | tr '\\n' ' '"))
+  dump_network()
+
+  -- A wrong clock breaks TLS. Give timesyncd a moment, but don't block on it.
+  for _ = 1, CLOCK_TIMEOUT do
+    if clock_synced() then break end
+    sys.sleep(1)
+  end
+  if clock_synced() then
+    info("clock synchronized: " .. utc_now())
+  else
+    warn("clock NOT synchronized yet after " .. CLOCK_TIMEOUT .. "s (now " .. utc_now() .. "); TLS may fail if it is far off")
+  end
+
+  note("step 3/4: tailscale up (max " .. MAX_ATTEMPTS .. " attempts)")
+  local cmd = "tailscale up --auth-key=file:" .. AUTHKEY_FILE .. " --ssh --hostname=" .. q(TS_HOSTNAME) .. " --timeout=60s"
+  local delay = 5
+  for attempt = 1, MAX_ATTEMPTS do
+    info("attempt " .. attempt .. "/" .. MAX_ATTEMPTS .. ": tailscale up --auth-key=file:" .. AUTHKEY_FILE
+      .. " --ssh --hostname=" .. TS_HOSTNAME)
+    local out, ok = capture(cmd .. " 2>&1")
+    for line in (out .. "\n"):gmatch("([^\n]*)\n") do
+      if line ~= "" then info("  | " .. line) end
+    end
+    if ok then break end
+    warn("tailscale up failed")
+    local low = out:lower()
+    if low:find("invalid") and low:find("key") or low:find("expired") or low:find("not valid") then
+      warn("hint: the auth key looks invalid/expired/used-up; create a new reusable key and rebuild")
+    elseif low:find("tagowners") or low:find("tags") then
+      warn("hint: tagged key needs tagOwners in the tailnet policy (see README)")
+    elseif low:find("x509") or low:find("certificate") then
+      warn("hint: TLS error; check the clock: " .. utc_now())
+    end
+    if attempt == MAX_ATTEMPTS then
+      err("giving up after " .. MAX_ATTEMPTS .. " attempts (systemd will restart this unit)")
+      return 1
+    end
+    info("retrying in " .. delay .. "s")
+    sys.sleep(delay)
+    delay = math.min(delay * 2, 60)
+  end
+
+  note("step 4/4: joined")
+  info("tailscale IPs: " .. capture("tailscale ip 2>/dev/null | tr '\\n' ' '"))
+  dump("tailscale status | head -n 10", "  ")
+  -- The tailnet may hand out "<name>-1" if an old node with the same name still exists.
+  local json = capture("tailscale status --json 2>/dev/null")
+  local self_block = json:match('"Self"%s*:%s*(%b{})') or ""
+  local name = (self_block:match('"DNSName"%s*:%s*"([^".]*)') or "")
+  if name ~= "" and name:lower() ~= TS_HOSTNAME:lower() then
+    warn("tailnet name is '" .. name .. "' (not '" .. TS_HOSTNAME .. "'): an older node with that name still exists")
+  end
+  note("done: connect with ssh root@" .. (name ~= "" and name or TS_HOSTNAME))
+  return 0
+end
+
+os.exit(main())

@@ -77,6 +77,34 @@ local function wifi_keyfile(env)
   }, "\n")
 end
 
+-- Wired profiles for STATIC_IP: the static one wins (higher priority) on the first port with a
+-- link; serverstick-dhcp covers every other port, and serverstick-netfind.lua switches to it for the
+-- boot when the static settings can't reach the internet.
+local function static_keyfile(env)
+  local dns = env.STATIC_DNS_LIST
+  if #dns == 0 then
+    dns = { "1.1.1.1", "9.9.9.9" }
+    if env.STATIC_GATEWAY ~= "" then table.insert(dns, 1, env.STATIC_GATEWAY) end
+  end
+  local addr = env.STATIC_CIDR .. (env.STATIC_GATEWAY ~= "" and ("," .. env.STATIC_GATEWAY) or "")
+  return table.concat({
+    "[connection]", "id=serverstick-static", "type=ethernet", "autoconnect=true", "autoconnect-priority=10", "",
+    "[ethernet]", "",
+    "[ipv4]", "method=manual", "address1=" .. addr, "dns=" .. table.concat(dns, ";") .. ";", "",
+    "[ipv6]", "method=auto", "",
+  }, "\n")
+end
+
+local function dhcp_keyfile()
+  return table.concat({
+    "[connection]", "id=serverstick-dhcp", "type=ethernet", "autoconnect=true", "autoconnect-priority=0",
+    "multi-connect=3", "",
+    "[ethernet]", "",
+    "[ipv4]", "method=auto", "",
+    "[ipv6]", "method=auto", "",
+  }, "\n")
+end
+
 -- SHA-512 crypt hash of the root password; the plain text goes to openssl on stdin, never argv.
 local function hash_password(password)
   local tmp = util.capture("mktemp")
@@ -117,9 +145,11 @@ return function(root, args)
   config.validate(env)
   local packages = config.packages(root)
   local boot_params = "copytoram=y cow_spacesize=" .. env.COW_SPACESIZE .. " systemd.gpt_auto=0 systemd.swap=0"
-  say(string.format("hostname=%s  extra packages=%s  wifi=%s  cow_spacesize=%s  net_fallback=%s  root password=%s",
+  say(string.format("hostname=%s  extra packages=%s  wifi=%s  static ip=%s  cow_spacesize=%s  net_fallback=%s (dhcp wait %ss)  root password=%s",
     env.TS_HOSTNAME, #env.EXTRA > 0 and table.concat(env.EXTRA, " ") or "none",
-    env.WIFI_SSID ~= "" and env.WIFI_SSID or "off", env.COW_SPACESIZE, env.NET_FALLBACK,
+    env.WIFI_SSID ~= "" and env.WIFI_SSID or "off",
+    env.STATIC_CIDR ~= "" and (env.STATIC_CIDR .. " via " .. (env.STATIC_GATEWAY ~= "" and env.STATIC_GATEWAY or "?")) or "off (DHCP)",
+    env.COW_SPACESIZE, env.NET_FALLBACK, env.NET_FALLBACK_WAIT,
     env.ROOT_PASSWORD ~= "" and "set" or "EMPTY (console login without password)"))
 
   -- The overlay holds tracked symlinks; they are lost on exFAT/NTFS checkouts.
@@ -181,23 +211,41 @@ return function(root, args)
     local perms = {
       { "/etc/tailscale", "0:0:700" },
       { "/etc/tailscale/authkey", "0:0:600" },
-      { "/usr/local/bin/tailscale-autojoin", "0:0:755" },
-      { "/usr/local/bin/serverstick-status", "0:0:755" },
-      { "/usr/local/bin/netfind", "0:0:755" },
+      { "/usr/local/bin/serverstick-autojoin.lua", "0:0:755" },
+      { "/usr/local/bin/serverstick-status.lua", "0:0:755" },
+      { "/usr/local/bin/serverstick-netfind.lua", "0:0:755" },
+      { "/usr/local/bin/serverstick-gwscan.lua", "0:0:755" },
     }
     -- mkarchiso copies airootfs without file modes, so every executable in the plugins needs an entry.
     for f in util.lines_of("find " .. q(A .. "/root/.tmux/plugins") .. " -type f -perm -u+x -not -path '*/.git/*'") do
       perms[#perms + 1] = { f:sub(#A + 1), "0:0:755" }
     end
 
-    if env.WIFI_SSID ~= "" then
-      local dir = A .. "/etc/NetworkManager/system-connections"
-      util.mkdir(dir, "700")
-      util.write(dir .. "/serverstick-wifi.nmconnection", wifi_keyfile(env))
-      util.must("chmod 600 " .. q(dir .. "/serverstick-wifi.nmconnection"))
-      perms[#perms + 1] = { "/etc/NetworkManager/system-connections", "0:0:700" }
-      perms[#perms + 1] = { "/etc/NetworkManager/system-connections/serverstick-wifi.nmconnection", "0:0:600" }
-      say("wifi profile: /etc/NetworkManager/system-connections/serverstick-wifi.nmconnection")
+    -- Read by serverstick-netfind.lua / serverstick-gwscan.lua (not secret).
+    util.mkdir(A .. "/etc/serverstick")
+    util.write(A .. "/etc/serverstick/network.conf", table.concat({
+      "# From .env at build time. NetworkManager profile: serverstick-static.",
+      "STATIC_IP=" .. env.STATIC_CIDR, "STATIC_GATEWAY=" .. env.STATIC_GATEWAY,
+      "STATIC_DNS=" .. table.concat(env.STATIC_DNS_LIST, " "),
+      "FALLBACK_WAIT=" .. env.NET_FALLBACK_WAIT, "",
+    }, "\n"))
+
+    -- NetworkManager keyfiles: root-only, or NetworkManager ignores them.
+    local nmdir = "/etc/NetworkManager/system-connections"
+    local function keyfile(name, text)
+      if not util.test("-d", A .. nmdir) then
+        util.mkdir(A .. nmdir, "700")
+        perms[#perms + 1] = { nmdir, "0:0:700" }
+      end
+      util.write(A .. nmdir .. "/" .. name, text)
+      util.must("chmod 600 " .. q(A .. nmdir .. "/" .. name))
+      perms[#perms + 1] = { nmdir .. "/" .. name, "0:0:600" }
+      say("NetworkManager profile: " .. nmdir .. "/" .. name)
+    end
+    if env.WIFI_SSID ~= "" then keyfile("serverstick-wifi.nmconnection", wifi_keyfile(env)) end
+    if env.STATIC_CIDR ~= "" then
+      keyfile("serverstick-static.nmconnection", static_keyfile(env))
+      keyfile("serverstick-dhcp.nmconnection", dhcp_keyfile())
     end
 
     step("Patching profiledef.sh")
