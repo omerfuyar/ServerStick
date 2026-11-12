@@ -49,4 +49,4 @@ indent(capture("tailscale status 2>&1 | head -n 15"), "")
 head("journalctl -u tailscale-autojoin (last 20)")
 indent(capture("journalctl -u tailscale-autojoin -n 20 --no-pager -o short --no-hostname 2>&1"), "")
 
-out(B .. "Re-run: serverstick-status.lua | follow: journalctl -fu tailscale-autojoin" .. R)
+out(B .. "Re-run: serverstick-status.lua | all commands: serverstick-help.lua | follow: journalctl -fu tailscale-autojoin" .. R)

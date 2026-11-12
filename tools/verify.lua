@@ -134,6 +134,7 @@ return function(root, args)
       { "/usr/local/bin/serverstick-status.lua", "-rwxr-xr-x" },
       { "/usr/local/bin/serverstick-netfind.lua", "-rwxr-xr-x" },
       { "/usr/local/bin/serverstick-gwscan.lua", "-rwxr-xr-x" },
+      { "/usr/local/bin/serverstick-help.lua", "-rwxr-xr-x" },
       { "/usr/local/lib/serverstick/sys.lua" }, { "/usr/local/lib/serverstick/net.lua" },
       { "/usr/bin/lua" }, { "/usr/bin/tcpdump" }, { "/usr/bin/arping" }, { "/usr/bin/curl" },
       { "/etc/serverstick/network.conf" },

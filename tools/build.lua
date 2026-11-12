@@ -215,6 +215,7 @@ return function(root, args)
       { "/usr/local/bin/serverstick-status.lua", "0:0:755" },
       { "/usr/local/bin/serverstick-netfind.lua", "0:0:755" },
       { "/usr/local/bin/serverstick-gwscan.lua", "0:0:755" },
+      { "/usr/local/bin/serverstick-help.lua", "0:0:755" },
     }
     -- mkarchiso copies airootfs without file modes, so every executable in the plugins needs an entry.
     for f in util.lines_of("find " .. q(A .. "/root/.tmux/plugins") .. " -type f -perm -u+x -not -path '*/.git/*'") do
