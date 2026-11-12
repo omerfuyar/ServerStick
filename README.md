@@ -9,7 +9,7 @@ tailnet. Boot it (BIOS or UEFI, Secure Boot off), and it copies itself to RAM, g
 1. **Make an auth key** in the Tailscale admin console → Settings → Keys: **reusable**, **ephemeral**,
    **pre-approved** (if device approval is on). It expires after at most 90 days; rebuild with a new one.
 2. **Configure:** `cp .env.example .env`, set `TS_AUTHKEY` (and `ROOT_PASSWORD`), then `chmod 600 .env`.
-3. **Build** (Arch-based host, repo on ext4/btrfs; asks for sudo once):
+3. **Build** (Arch-based host with the [requirements](#host-requirements), repo on ext4/btrfs; asks for sudo once):
    ```bash
    ./serverstick.lua build
    ```
@@ -88,4 +88,23 @@ and LVM/RAID auto-activation is masked. The NVIDIA driver (`nvidia-open`) needs 
 | `build/`, `work/`, `out/` | Build output (gitignored) |
 
 `./serverstick.lua test-qemu serial` boots the ISO in QEMU and checks that it joins (the VM really joins
-your tailnet). Host requirements: Lua 5.1+, archiso, git, openssl, and QEMU for tests.
+your tailnet).
+
+## Host requirements
+
+An Arch-based Linux host (Arch, CachyOS, EndeavourOS, ...) with:
+
+| Package | Used for |
+|---|---|
+| `lua` (5.1 or newer, or `luajit`) | Runs `serverstick.lua` and everything in `tools/` |
+| `archiso` | `mkarchiso`, plus `squashfs-tools`, `libisoburn` (xorriso), `mtools`, `libarchive` (bsdtar) for build and verify. `build` installs it if missing |
+| `openssl` | Hashes `ROOT_PASSWORD` (SHA-512 crypt) so only the hash goes into the ISO |
+| `git` | Fetches the tmux plugins baked into the image |
+| `sudo` | mkarchiso and `flash` need root (not needed if you run as root) |
+| `util-linux`, `coreutils`, `diffutils` | `lsblk`, `findmnt`, `dd`, `cmp`, ... (on every Arch system) |
+| `qemu-system-x86` | Optional: `test-qemu` |
+| `edk2-ovmf` | Optional: `test-qemu uefi` |
+
+```bash
+sudo pacman -S --needed lua archiso openssl git
+```
